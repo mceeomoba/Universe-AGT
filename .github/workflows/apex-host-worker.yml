@@ -1,1 +1,47 @@
-
+name: apex-host-worker
+on:
+  workflow_dispatch:
+  push:
+    paths: ['apex-src.b64.txt', 'agent-host-platform/host-worker/**', 'agent-host-platform/scripts/install-host.sh']
+permissions:
+  contents: write
+concurrency:
+  group: apex-host-worker
+  cancel-in-progress: false
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if [ -f apex-src.b64.txt ]; then
+            base64 -d apex-src.b64.txt | tar xz
+            git rm -q --cached apex-src.b64.txt; rm apex-src.b64.txt
+            git config user.name apex-bot
+            git config user.email apex-bot@users.noreply.github.com
+            git add -A
+            git commit -m "Apex: host-worker, installer, docs"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+  test:
+    needs: unpack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: unit tests
+        working-directory: agent-host-platform/host-worker
+        run: npm test
+      - name: installer syntax and shellcheck
+        run: |
+          bash -n agent-host-platform/scripts/install-host.sh
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -S warning agent-host-platform/scripts/install-host.sh || true
+      - name: real docker smoke (build + run + health + rollback path)
+        working-directory: agent-host-platform/host-worker
+        run: node test/docker-smoke.mjs
