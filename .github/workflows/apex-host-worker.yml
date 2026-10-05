@@ -2,7 +2,7 @@ name: apex-host-worker
 on:
   workflow_dispatch:
   push:
-    paths: ['apex-src.b64.txt', 'agent-host-platform/host-worker/**', 'agent-host-platform/scripts/install-host.sh']
+    paths: ['apex-src.b64.txt', 'apex-ci-update.txt', 'agent-host-platform/host-worker/**', 'agent-host-platform/scripts/install-host.sh']
 permissions:
   contents: write
 concurrency:
@@ -45,3 +45,50 @@ jobs:
       - name: real docker smoke (build + run + health + rollback path)
         working-directory: agent-host-platform/host-worker
         run: node test/docker-smoke.mjs
+  installer-e2e:
+    needs: unpack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: start fake control plane (records bearer SHA-256 only)
+        run: |
+          rm -f /tmp/plane.log; touch /tmp/plane.log
+          nohup node agent-host-platform/host-worker/test/fake-plane.mjs 18080 /tmp/plane.log >/tmp/plane.out 2>&1 &
+          sleep 2
+      - name: diagnose
+        run: sudo bash agent-host-platform/scripts/install-host.sh diagnose --control-plane http://127.0.0.1:18080
+      - name: install (real systemd, private Node, authenticated heartbeat)
+        run: |
+          sudo bash agent-host-platform/scripts/install-host.sh install --control-plane http://127.0.0.1:18080 --host-id ci-host --worker-src-dir "$PWD/agent-host-platform/host-worker" | tee /tmp/install.out
+      - name: verify credential handling and service
+        run: |
+          set -e
+          DIGEST=$(grep 'token sha256' /tmp/install.out | awk '{print $NF}')
+          echo "digest=$DIGEST"
+          # authenticated heartbeats arrived carrying exactly that credential
+          grep -q "\"bearer_sha256\":\"$DIGEST\"" /tmp/plane.log && echo "heartbeat auth matches digest"
+          # service itself keeps heartbeating (not just the installer check)
+          for i in $(seq 1 20); do n=$(grep -c '/heartbeat' /tmp/plane.log); [ "$n" -ge 2 ] && break; sleep 3; done; [ "$n" -ge 2 ]
+          systemctl is-active agent-host-worker.service
+          # the credential is not in output, env file, journal, or process arguments
+          TOKEN=$(sudo cat /opt/agent-host/config/host.token)
+          ! grep -q "$TOKEN" /tmp/install.out
+          ! sudo grep -q "$TOKEN" /opt/agent-host/config/worker.env
+          ! sudo journalctl -u agent-host-worker --no-pager | grep -q "$TOKEN"
+          ! ps -eo args | grep -q "$TOKEN"
+          test "$(sudo stat -c %a /opt/agent-host/config/host.token)" = 600
+          test "$(sudo stat -c %U /opt/agent-host/config/host.token)" = agent-host
+          sudo systemctl show agent-host-worker -p Restart | grep -q Restart=always
+          echo "credential handling PASS"
+      - name: status command is redacted
+        run: sudo bash agent-host-platform/scripts/install-host.sh status
+      - name: cleanup
+        if: always()
+        run: |
+          sudo systemctl disable --now agent-host-worker.service || true
+          sudo rm -rf /opt/agent-host /etc/systemd/system/agent-host-worker.service
