@@ -18,7 +18,9 @@ TEST_DATABASE_URL=postgresql://localhost/universe NODE_ENV=test npm test
 Migrate only into a dedicated empty local database. Bootstrap writes a private
 operator token file; keep it outside this repository. Supply DATABASE_URL privately.
 LOCAL_HTTP=1 permits localhost test transport only, not production use. Production
-TLS termination configuration is still pending. The API binds localhost by default.
+TLS termination needs a loopback-only reverse proxy. TRUST_LOOPBACK_PROXY=1 trusts
+forwarded protocol only from 127.0.0.1; keep port 8080 bound to localhost. Production
+certificate and firewall configuration is not yet live-proven.
 
 Optional storage migration 003 runs separately on an approved Supabase project.
 SUPABASE_URL and SUPABASE_STORAGE_KEY are server-only configuration. Uploads are

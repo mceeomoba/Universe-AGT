@@ -1,8 +1,8 @@
 # Acceptance evidence
 
 Local evidence: foundation SQL and credential-binding migrations applied to
-PostgreSQL 14; TypeScript compiles; four validation/security tests and one real
-PostgreSQL integration test pass. Integration verifies authentication, tenant RLS,
+PostgreSQL 14; TypeScript compiles; ten tests pass, including four PostgreSQL API/security suites and mocked private
+storage transfer verification. Secret encryption rejects tampering and context swapping. Integration verifies authentication, tenant RLS,
 manual approval, idempotency/conflict, eight simultaneous claims yielding one,
 lease recovery, stale-token rejection, and append-only journal.
 

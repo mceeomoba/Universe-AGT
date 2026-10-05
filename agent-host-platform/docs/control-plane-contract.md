@@ -17,8 +17,8 @@ Applications: {project_id: UUID,status:"running"|"stopped"|"unhealthy"|"crash_lo
 `POST /v1/hosts/:id/tasks/claim` {} returns
 {task:null} or {task:{id,type,payload,lease_token,lease_expires_at,...},lease_token,lease_expires_at}.
 One task per request. Payload uses project_id UUID, artifact_id UUID, version,
-and deployment_id when managing an existing deployment. Project names and manifests
-come from registered project metadata and the archive. Task types outside the
+and deployment_id for deployment tasks and service commands. Claimed payload also
+includes project (registered project name). Manifests come from the archive. Task types outside the
 worker's advertised capabilities are not claimed.
 
 `POST /v1/tasks/:id/start` {lease_token}. Do not execute if rejected.
@@ -45,9 +45,18 @@ Do not follow archive links during builds. Artifact upload/finalize is agent-sco
 ## State and secrets
 Deployment rows update atomically with the fenced complete/fail transition.
 Events are append-only and emitted by the API. Worker event/report endpoints are
-not implemented; do not depend on them. Secrets and domains remain disabled until
-private, scoped configuration is authorized. No credentials in artifacts or logs.
+not implemented; do not depend on them. Secret delivery is optional and requires a private encryption key; domains remain
+disabled until private scoped configuration is authorized. No credentials in artifacts or logs.
 A worker with a claimed task may not claim success for another host or tenant.
+
+## Runtime secrets
+Operator-only PUT /v1/projects/:id/secrets {name,value} stores AES-256-GCM ciphertext
+using a server-only 32-byte key supplied privately as SECRETS_ENCRYPTION_KEY (hex).
+Secret names only appear in task secret_refs. Duplicate references are rejected.
+POST /v1/tasks/:id/secrets {lease_token} returns {env} only to the assigned host of
+a running, unexpired fenced task, and only for explicitly requested references.
+No deployment-secret GET. Do not log, persist or include returned values in events,
+results, error traces or artifact files. Missing key or secret fails closed.
 
 ## Cancellation
 Queued or awaiting-approval tasks may be cancelled. Claimed/running tasks return

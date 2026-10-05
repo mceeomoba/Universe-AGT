@@ -1,0 +1,4 @@
+import{createCipheriv,createDecipheriv,randomBytes}from'node:crypto';
+function key(){const k=process.env.SECRETS_ENCRYPTION_KEY;if(!k||!/^[a-f0-9]{64}$/.test(k))throw Object.assign(new Error('Secret storage unavailable'),{statusCode:503});return Buffer.from(k,'hex')}
+export function encrypt(value:string,context:string){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',key(),iv);cipher.setAAD(Buffer.from(context));const ciphertext=Buffer.concat([cipher.update(value,'utf8'),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),ciphertext]).toString('base64')}
+export function decrypt(value:string,context:string){const data=Buffer.from(value,'base64');if(data.length<28)throw Error('Invalid ciphertext');const cipher=createDecipheriv('aes-256-gcm',key(),data.subarray(0,12));cipher.setAuthTag(data.subarray(12,28));cipher.setAAD(Buffer.from(context));return Buffer.concat([cipher.update(data.subarray(28)),cipher.final()]).toString('utf8')}
