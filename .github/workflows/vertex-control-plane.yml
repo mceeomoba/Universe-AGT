@@ -1,0 +1,83 @@
+name: vertex-control-plane
+on:
+  push:
+    paths: ['vertex-src.b64.txt', 'agent-host-platform/control-plane/**', 'agent-host-platform/database/**', 'agent-host-platform/tests/**', '.github/workflows/vertex-control-plane.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: vertex-control-plane
+  cancel-in-progress: false
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      ready: ${{ steps.source.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f vertex-src.b64.txt ]; then
+            mkdir /tmp/vertex-source
+            base64 -d vertex-src.b64.txt | tar xz -C /tmp/vertex-source
+            python3 - <<'PY'
+          from pathlib import Path
+          allowed=('control-plane/','database/','agent-sdk/','cli/','tests/','docs/control-plane-contract.md','docs/acceptance.md','examples/sample-app/','scripts/migrate.ts','scripts/bootstrap.ts','README.md','package.json','package-lock.json','tsconfig.json','.gitignore')
+          root=Path('/tmp/vertex-source/agent-host-platform')
+          for f in root.rglob('*'):
+              if f.is_symlink(): raise SystemExit('symlink forbidden')
+              if f.is_file() and not any(str(f.relative_to(root)).startswith(x) for x in allowed): raise SystemExit('path outside Vertex ownership')
+          PY
+            cp -a /tmp/vertex-source/agent-host-platform/. agent-host-platform/
+            git rm vertex-src.b64.txt
+            git config user.name vertex-bot
+            git config user.email vertex-bot@users.noreply.github.com
+            git add agent-host-platform
+            git commit -m 'Vertex: control-plane foundation, SDKs and tests'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ -f agent-host-platform/package.json ]; then echo "ready=true" >> "$GITHUB_OUTPUT"; fi
+  test:
+    needs: source
+    if: needs.source.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: local-ci-only
+          POSTGRES_DB: universe
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: agent-host-platform
+    env:
+      DATABASE_URL: postgresql://postgres:local-ci-only@localhost:5432/universe
+      TEST_DATABASE_URL: postgresql://postgres:local-ci-only@localhost:5432/universe
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run migrate
+      - run: npm run build
+      - run: npm test
+      - run: python3 -m py_compile agent-sdk/python/client.py
