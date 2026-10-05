@@ -23,6 +23,8 @@ export function makeApi({ baseUrl, hostId, getToken, fetchImpl = fetch, sleep = 
     renew: (id, lease) => call('POST', `/v1/tasks/${id}/renew`, { lease_token: lease }, { retries: 0 }),
     complete: (id, lease, result) => call('POST', `/v1/tasks/${id}/complete`, { lease_token: lease, result }),
     fail: (id, lease, code, rolledBack) => call('POST', `/v1/tasks/${id}/fail`, { lease_token: lease, code, rolled_back: !!rolledBack }),
+    // Returns {env}. Never log the response; callers must not persist it.
+    secrets: (id, lease) => call('POST', `/v1/tasks/${id}/secrets`, { lease_token: lease }, { retries: 1 }),
     artifact: (id) => call('GET', `/v1/artifacts/${id}`),                       // -> {artifact:{checksum,size,version}, download_url}
     download: async (url) => { const r = await fetchImpl(url); if (!r.ok) throw new ApiError('artifact download HTTP ' + r.status, r.status); return r; },
   };

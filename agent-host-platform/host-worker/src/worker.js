@@ -13,12 +13,13 @@ export function makeWorker({ api, docker, cfg, state, save, version, sleep = (ms
 
   async function execute(task, leaseLost) {
     const ctx = { api, docker, cfg, state, save, health, metrics, leaseLost };
+    const guard = () => { if (leaseLost()) throw Object.assign(new Error('lease lost'), { code: 'LEASE_EXPIRED' }); };
     switch (task.type) {
       case 'deploy': case 'update': return deploy(task, ctx);
       case 'rollback': return rollback(task, ctx);
-      case 'restart': { const a = appOf(task); await docker.restart(a.current.container); return ok(a, 'running'); }
-      case 'stop': { const a = appOf(task); await docker.stop(a.current.container); return ok(a, 'stopped'); }
-      case 'start': { const a = appOf(task); await docker.start(a.current.container); return ok(a, 'running'); }
+      case 'restart': { const a = appOf(task); guard(); await docker.restart(a.current.container); return ok(a, 'running'); }
+      case 'stop': { const a = appOf(task); guard(); await docker.stop(a.current.container); return ok(a, 'stopped'); }
+      case 'start': { const a = appOf(task); guard(); await docker.start(a.current.container); return ok(a, 'running'); }
       case 'status': { const a = appOf(task); const s = await docker.state(a.current.container); return ok(a, s?.Running ? 'running' : 'stopped', s?.Running ? 'healthy' : 'unhealthy'); }
       case 'healthcheck': { const a = appOf(task); const h = await health(a.current.hostPort, a.current.manifest.healthcheck, { timeoutMs: 5000 }); return ok(a, 'running', h.ok ? 'healthy' : 'unhealthy'); }
       case 'system-info': return { health: 'healthy', container_ids: [], status: 'running' };
@@ -49,13 +50,15 @@ export function makeWorker({ api, docker, cfg, state, save, version, sleep = (ms
   async function runOne(t, lease) {
     // Never execute unless start was acknowledged.
     try { await api.start(t.id, lease); } catch (e) { console.error(JSON.stringify({ level: 'warn', msg: 'start not acknowledged, task skipped', task: t.id, error: e.message })); return; }
-    let lost = false;
-    const timer = setInterval(() => { api.renew(t.id, lease).catch((e) => { if (e.status === 403 || e.status === 409 || e.status === 410) lost = true; }); }, cfg.leaseRenewMs || 30000);
+    // Lease lost = server fenced us (403/409/410) OR no successful renewal for longer than the safe window (prolonged outage: the 90s lease may have expired and been re-claimed).
+    let fenced = false, lastOk = Date.now(); const ttl = cfg.leaseSafeMs || 75000;
+    const isLost = () => fenced || Date.now() - lastOk > ttl;
+    const timer = setInterval(() => { api.renew(t.id, lease).then(() => { lastOk = Date.now(); }).catch((e) => { if (e.status === 403 || e.status === 409 || e.status === 410) fenced = true; }); }, cfg.leaseRenewMs || 30000);
     let out;
-    try { out = { kind: 'complete', result: await execute(t, () => lost) }; }
+    try { out = { kind: 'complete', result: await execute(t, isLost) }; }
     catch (e) { out = { kind: 'fail', code: e.code || 'EXECUTION_FAILED', rolled_back: !!e.rolledBack }; console.error(JSON.stringify({ level: 'warn', msg: 'task failed', task: t.id, code: out.code, error: String(e.message).slice(0, 300) })); }
     finally { clearInterval(timer); }
-    if (lost) out = { kind: 'fail', code: 'LEASE_EXPIRED', rolled_back: false };
+    if (isLost()) out = { kind: 'fail', code: 'LEASE_EXPIRED', rolled_back: false };
     state.pending[t.id] = { ...out, lease }; await save(); // persist the outcome BEFORE reporting
     await flush(t.id);
   }

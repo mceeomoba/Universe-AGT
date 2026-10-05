@@ -14,7 +14,8 @@ heartbeat (flat body: version, capabilities, cpu/mem/disk, uptime, docker, appli
 - Before repeating a deployment, the worker checks Docker for the same deployment already running and reports it instead of rebuilding.
 - Only advertised task types run: deploy, update, start, stop, restart, rollback, status, healthcheck, system-info. Docker is called with an argv allowlist, never through a shell.
 - Artifacts: download_url fetched directly, size and SHA-256 verified, archives with links, special files or traversal are rejected before extraction.
-- Secrets and domains are not implemented (disabled by contract).
+- Secrets: only when the task lists `secret_refs`; fetched with the fenced `POST /v1/tasks/:id/secrets`, passed to `docker run` through a 0600 env-file deleted immediately (never argv), never logged, persisted or returned. Missing/denied secrets fail closed. Rollback restarts the retained previous container so secrets are not re-fetched or stored. Domains are not implemented.
+- Lease loss: a fenced 403/409/410 on renew, or no successful renewal for 75s (prolonged outage), stops further side effects (checked before build, run, switch, rollback and control commands) and reports `LEASE_EXPIRED`.
 
 ## Deploy flow
 claim, fetch artifact, verify, safe-extract, validate `agent.deploy.json`, capacity check, build, run on a unique container bound to 127.0.0.1, health check, switch. Any failure removes the new container and the previous version keeps running (`rolled_back:true`). The previous version is kept stopped so rollback is instant.

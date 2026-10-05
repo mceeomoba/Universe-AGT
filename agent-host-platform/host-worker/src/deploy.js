@@ -72,8 +72,14 @@ export async function deploy(task, ctx) {
     if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before build');
     try { await docker.build(image, dir, path.join(dir, manifest.dockerfile)); } catch (e) { throw fail('BUILD_FAILED', e.message); }
     if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before run');
+    let env = {};
+    if (Array.isArray(p.secret_refs) && p.secret_refs.length) { // fail closed: missing/denied secrets abort the deploy; values are never logged or persisted
+      try { env = (await api.secrets(task.id, task.lease_token)).env || {}; } catch (e) { throw fail('EXECUTION_FAILED', 'secrets unavailable'); }
+      if (p.secret_refs.some((n) => !(n in env))) throw fail('EXECUTION_FAILED', 'secrets unavailable');
+    }
     const hostPort = pickPort(state);
-    await docker.run({ name, image, project: projectId, deployment: deployId, version, hostPort, port: manifest.port, memory: manifest.memory, cpu: manifest.cpu, restart: manifest.restart, env: {} });
+    await docker.run({ name, image, project: projectId, deployment: deployId, version, hostPort, port: manifest.port, memory: manifest.memory, cpu: manifest.cpu, restart: manifest.restart, env });
+    env = null;
     started = true;
     const h = await health(hostPort, manifest.healthcheck);
     if (!h.ok) throw fail('HEALTH_FAILED', 'health check failed: ' + h.reason);
@@ -93,15 +99,16 @@ export async function deploy(task, ctx) {
 }
 
 export async function rollback(task, ctx) {
-  const { docker, state, save, health = httpHealth } = ctx; const projectId = safeId(task.payload?.project_id || '');
+  const { docker, state, save, health = httpHealth, leaseLost = () => false } = ctx; const projectId = safeId(task.payload?.project_id || '');
   const app = state.apps[projectId]; if (!app || !app.previous?.length) throw fail('EXECUTION_FAILED', 'no previous version to roll back to');
   const prev = app.previous[0], cur = app.current;
-  const name = `app-${projectId}-rb${Date.now().toString(36)}`;
-  await docker.run({ name, image: prev.image, project: projectId, deployment: prev.deployment, version: prev.version, hostPort: prev.hostPort, port: prev.manifest.port, memory: prev.manifest.memory, cpu: prev.manifest.cpu, restart: prev.manifest.restart, env: {} });
+  if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before rollback');
+  // Restart the retained (stopped) previous container: keeps its original config including injected secrets, which are never stored by the worker.
+  if (cur) await docker.stop(cur.container).catch(() => {});
+  try { await docker.start(prev.container); } catch (e) { if (cur) await docker.start(cur.container).catch(() => {}); throw fail('EXECUTION_FAILED', 'previous version not restartable'); }
   const h = await health(prev.hostPort, prev.manifest.healthcheck);
-  if (!h.ok) { await docker.rm(name).catch(() => {}); throw fail('HEALTH_FAILED', 'rollback target unhealthy: ' + h.reason); }
+  if (!h.ok || leaseLost()) { await docker.stop(prev.container).catch(() => {}); if (cur) await docker.start(cur.container).catch(() => {}); throw fail(h.ok ? 'LEASE_EXPIRED' : 'HEALTH_FAILED', 'rollback aborted'); }
   if (cur) await docker.rm(cur.container).catch(() => {});
-  await docker.rm(prev.container).catch(() => {});
-  app.current = { ...prev, container: name }; app.previous = app.previous.slice(1); await save();
-  return { deployment_id: task.payload?.deployment_id, health: 'healthy', container_ids: [name], status: 'rolled_back' };
+  app.current = { ...prev }; app.previous = app.previous.slice(1); await save();
+  return { deployment_id: task.payload?.deployment_id, health: 'healthy', container_ids: [prev.container], status: 'rolled_back' };
 }

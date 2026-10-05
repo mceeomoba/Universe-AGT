@@ -22,5 +22,9 @@ try {
   const { httpHealth } = await import('../src/deploy.js');
   await assert.rejects(deploy({ id: 'd2', payload: { project_id: PID, version: '2', artifact_id: 'bad', deployment_id: 'd2' } }, { ...ctx, health: (p, h) => httpHealth(p, h, { timeoutMs: 8000, intervalMs: 1000 }) }), /health check failed/);
   const st = await docker.state(c1); assert.equal(st.Running, true, 'v1 must keep running after failed v2');
+  // env-file secret injection works for real and leaves no temp file behind
+  const cur = state.apps[PID].current;
+  await docker.run({ name: 'smoke-env', image: cur.image, project: PID, deployment: 'envtest', version: 'e', hostPort: 29990, port: 8080, memory: 134217728, cpu: 0.5, restart: 'no', env: { SMOKE_SECRET: 'abc123' } });
+  assert.ok(execFileSync('docker', ['inspect', '-f', '{{json .Config.Env}}', 'smoke-env']).toString().includes('SMOKE_SECRET=abc123'));
   console.log('DOCKER SMOKE PASS', events.join(','));
 } finally { for (const c of await docker.list()) await docker.rm(c.Names).catch(() => {}); }
