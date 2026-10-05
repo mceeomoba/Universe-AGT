@@ -80,5 +80,5 @@ export function makeWorker({ api, docker, cfg, state, save, version, sleep = (ms
       catch (e) { console.error(JSON.stringify({ level: 'warn', msg: 'tick failed', error: e.message })); await sleep(backoff); backoff = Math.min(backoff * 2, 60000); }
     }
   }
-  return { tick, loop, execute, stop: () => { running = false; } };
+  return { tick, loop, execute, heartbeat, stop: () => { running = false; } };
 }
