@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent Host Worker (outbound-only deployment worker)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-host
+Group=agent-host
+EnvironmentFile=/opt/agent-host/config/worker.env
+WorkingDirectory=/opt/agent-host/worker
+ExecStart=/usr/bin/node /opt/agent-host/worker/src/index.js
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=20
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/agent-host /srv/agent-apps
+
+[Install]
+WantedBy=multi-user.target

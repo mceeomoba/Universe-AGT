@@ -1,0 +1,4 @@
+{ "name": "agent-host-worker", "version": "0.1.0", "type": "module", "private": true,
+  "description": "Persistent-host worker: outbound HTTPS only, zero runtime dependencies.",
+  "engines": { "node": ">=20" },
+  "scripts": { "test": "node --test test/worker.test.js", "start": "node src/index.js" } }
