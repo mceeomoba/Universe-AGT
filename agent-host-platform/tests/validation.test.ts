@@ -1,0 +1,5 @@
+import test from'node:test';import assert from'node:assert/strict';import{task,complete,heartbeat}from'../control-plane/api/validation.js';import{requireHost,requireScope,digest,mint,Principal}from'../control-plane/authentication/auth.js';
+test('strict command allowlist and no arbitrary shell/secrets',()=>{assert.equal(task.safeParse({type:'shell',host_id:'x',idempotency_key:'12345678'}).success,false);assert.equal(complete.safeParse({lease_token:crypto.randomUUID(),result:{logs:'token=secret'}}).success,false)});
+test('host identity and scope independent gates',()=>{const p:Principal={credential_id:'x',tenant_id:'t',subject_id:'h1',kind:'host',scopes:['worker']};requireHost(p,'h1');assert.throws(()=>requireHost(p,'h2'));assert.throws(()=>requireScope(p,'deploy'))});
+test('strong generated token digest',()=>{const token=mint();assert.ok(token.length>40);assert.match(digest(token),/^[a-f0-9]{64}$/);assert.notEqual(mint(),token)});
+test('heartbeat refuses freeform secrets and private IP',()=>{assert.equal(heartbeat.safeParse({private_ip:'10.0.0.1'}).success,false)});

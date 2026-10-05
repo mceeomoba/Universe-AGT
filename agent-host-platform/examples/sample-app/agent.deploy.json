@@ -1,0 +1,1 @@
+{"name":"sample-app","runtime":"docker","build":{"dockerfile":"Dockerfile"},"service":{"port":8080,"healthcheck":"/health"},"resources":{"memory":"128m","cpu":0.5},"restart":"unless-stopped"}

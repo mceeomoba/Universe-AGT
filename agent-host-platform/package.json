@@ -1,0 +1,34 @@
+{
+  "name": "agent-host-platform",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
+    "start": "node dist/control-plane/api/server.js",
+    "migrate": "tsx scripts/migrate.ts",
+    "bootstrap": "tsx scripts/bootstrap.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/rate-limit": "^11.2.0",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "type": "module"
+}
