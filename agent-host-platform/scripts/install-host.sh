@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Installs the Agent Host Worker as a systemd service. Outbound HTTPS only; nothing listens publicly.
-# Usage: AGENT_HOST_CONTROL_PLANE=https://... AGENT_HOST_ENROLLMENT_TOKEN=... AGENT_HOST_WORKER_SRC=<url|dir> ./install-host.sh
-# The enrollment token is read from the environment, never passed on a command line or logged.
+# Usage: AGENT_HOST_CONTROL_PLANE=https://... AGENT_HOST_ID=... AGENT_HOST_TOKEN=... AGENT_HOST_WORKER_SRC=<url|dir> ./install-host.sh
+# The credential is read from the environment, never passed on a command line or logged.
 set -euo pipefail
 : "${AGENT_HOST_CONTROL_PLANE:?set AGENT_HOST_CONTROL_PLANE}"
-: "${AGENT_HOST_ENROLLMENT_TOKEN:?set AGENT_HOST_ENROLLMENT_TOKEN}"
+: "${AGENT_HOST_ID:?set AGENT_HOST_ID (host id registered by the operator)}"
+: "${AGENT_HOST_TOKEN:?set AGENT_HOST_TOKEN (operator-issued host credential)}"
 SRC="${AGENT_HOST_WORKER_SRC:-}"; SHA="${AGENT_HOST_WORKER_SHA256:-}"
 ROOT=/opt/agent-host; APPS=/srv/agent-apps; USER_NAME=agent-host
 log() { printf '[install] %s\n' "$*"; }
@@ -34,7 +35,8 @@ else echo "set AGENT_HOST_WORKER_SRC to a worker tarball URL or directory"; exit
 umask 077
 cat > "$ROOT/config/worker.env" <<ENV
 AGENT_HOST_CONTROL_PLANE=$AGENT_HOST_CONTROL_PLANE
-AGENT_HOST_ENROLLMENT_TOKEN=$AGENT_HOST_ENROLLMENT_TOKEN
+AGENT_HOST_ID=$AGENT_HOST_ID
+AGENT_HOST_TOKEN=$AGENT_HOST_TOKEN
 AGENT_HOST_NAME=${AGENT_HOST_NAME:-$(hostname)}
 AGENT_HOST_ROOT=$ROOT
 AGENT_APPS_DIR=$APPS
@@ -43,4 +45,4 @@ chown -R "$USER_NAME:$USER_NAME" "$ROOT" "$APPS"; chmod 600 "$ROOT/config/worker
 install -m 644 "$ROOT/worker/systemd/agent-host-worker.service" /etc/systemd/system/agent-host-worker.service
 systemctl daemon-reload; systemctl enable --now agent-host-worker.service
 sleep 5
-systemctl is-active --quiet agent-host-worker.service && log "worker running; it will register with the control plane on its first poll" || { journalctl -u agent-host-worker -n 30 --no-pager; exit 1; }
+systemctl is-active --quiet agent-host-worker.service && log "worker running; it will heartbeat with its operator-issued credential" || { journalctl -u agent-host-worker -n 30 --no-pager; exit 1; }

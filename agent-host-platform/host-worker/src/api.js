@@ -1,31 +1,29 @@
-// Control-plane client. Outbound HTTPS only. Retries with backoff on network/5xx errors.
-export function makeApi({ baseUrl, getToken, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
-  async function call(method, path, body, { retries = 5, raw = false } = {}) {
+// Control-plane client for Worker protocol v1 (docs/control-plane-contract.md). Outbound HTTPS only.
+export class ApiError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
+export function makeApi({ baseUrl, hostId, getToken, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  async function call(method, path, body, { retries = 4 } = {}) {
     let delay = 500, last;
     for (let i = 0; i <= retries; i++) {
       try {
-        const res = await fetchImpl(baseUrl.replace(/\/$/, '') + path, { method, headers: { 'content-type': 'application/json', ...(getToken() ? { authorization: 'Bearer ' + getToken() } : {}) }, body: body ? JSON.stringify(body) : undefined });
-        if (res.status >= 500 || res.status === 429) throw Object.assign(new Error('HTTP ' + res.status), { retry: true });
-        if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status} ${path}`), { status: res.status });
-        return raw ? res : (res.status === 204 ? {} : await res.json());
+        const res = await fetchImpl(baseUrl.replace(/\/$/, '') + path, { method, headers: { 'content-type': 'application/json', authorization: 'Bearer ' + getToken() }, body: body === undefined ? undefined : JSON.stringify(body) });
+        if (res.status >= 500 || res.status === 429) throw Object.assign(new ApiError('HTTP ' + res.status, res.status), { retry: true });
+        if (!res.ok) throw new ApiError(`HTTP ${res.status} ${path}`, res.status);
+        return res.status === 204 ? {} : await res.json();
       } catch (e) {
-        last = e; if (e.status && !e.retry) throw e;
+        last = e; if (e instanceof ApiError && !e.retry) throw e;
         if (i < retries) { await sleep(delay + Math.random() * 250); delay = Math.min(delay * 2, 30000); }
       }
     }
     throw last;
   }
   return {
-    register: (b) => call('POST', '/v1/hosts/register', b),
-    heartbeat: (id, b) => call('POST', `/v1/hosts/${id}/heartbeat`, b),
-    claim: (id, max) => call('POST', `/v1/hosts/${id}/tasks/claim`, { max }),
-    start: (taskId, lease) => call('POST', `/v1/tasks/${taskId}/start`, { lease_token: lease }),
-    event: (taskId, type, data, lease) => call('POST', `/v1/tasks/${taskId}/events`, { type, data, lease_token: lease }, { retries: 1 }),
-    complete: (taskId, result, lease) => call('POST', `/v1/tasks/${taskId}/complete`, { result, lease_token: lease }),
-    fail: (taskId, error, lease) => call('POST', `/v1/tasks/${taskId}/fail`, { error, lease_token: lease }),
-    artifactMeta: (id) => call('GET', `/v1/artifacts/${id}`),
-    artifactDownload: (id) => call('GET', `/v1/artifacts/${id}/download`, null, { raw: true }),
-    secrets: (deploymentId) => call('GET', `/v1/deployments/${deploymentId}/secrets`),
-    upsertDeployment: (b) => call('POST', '/v1/deployments/report', b),
+    heartbeat: (b) => call('POST', `/v1/hosts/${hostId}/heartbeat`, b),
+    claim: () => call('POST', `/v1/hosts/${hostId}/tasks/claim`, {}),           // -> {task|null, lease_token, lease_expires_at}
+    start: (id, lease) => call('POST', `/v1/tasks/${id}/start`, { lease_token: lease }, { retries: 1 }),
+    renew: (id, lease) => call('POST', `/v1/tasks/${id}/renew`, { lease_token: lease }, { retries: 0 }),
+    complete: (id, lease, result) => call('POST', `/v1/tasks/${id}/complete`, { lease_token: lease, result }),
+    fail: (id, lease, code, rolledBack) => call('POST', `/v1/tasks/${id}/fail`, { lease_token: lease, code, rolled_back: !!rolledBack }),
+    artifact: (id) => call('GET', `/v1/artifacts/${id}`),                       // -> {artifact:{checksum,size,version}, download_url}
+    download: async (url) => { const r = await fetchImpl(url); if (!r.ok) throw new ApiError('artifact download HTTP ' + r.status, r.status); return r; },
   };
 }

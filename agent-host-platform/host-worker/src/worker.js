@@ -1,45 +1,72 @@
-// Host worker main loop: register, heartbeat, claim, execute allowlisted task types, report. Outbound only.
-import { deploy, rollback, safeId } from './deploy.js';
+// Host worker main loop for Worker protocol v1. Credentials are operator-issued (AGENT_HOST_ID / AGENT_HOST_TOKEN); no anonymous enrollment.
+import { deploy, rollback, safeId, httpHealth } from './deploy.js';
 import { systemMetrics } from './metrics.js';
 
-export const TASK_ALLOWLIST = ['deploy', 'update', 'restart', 'stop', 'start', 'remove', 'rollback', 'logs', 'status', 'healthcheck', 'system-info'];
+// Exactly what is advertised in the heartbeat. Tasks outside this set are never claimed by the server; refused here too.
+export const CAPABILITIES = ['deploy', 'update', 'start', 'stop', 'restart', 'rollback', 'status', 'healthcheck', 'system-info'];
 
-export function makeWorker({ api, docker, cfg, state, save, version, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), health, metrics = systemMetrics }) {
-  let hostId = state.host_id || null, running = true;
-  const appOf = (t) => { const a = state.apps[safeId(t.payload?.project || '')]; if (!a?.current) throw new Error('unknown app: ' + t.payload?.project); return a; };
+export function makeWorker({ api, docker, cfg, state, save, version, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), health = httpHealth, metrics = systemMetrics }) {
+  let running = true;
+  state.pending = state.pending || {};
+  const appOf = (t) => { const a = state.apps[safeId(t.payload?.project_id || '')]; if (!a?.current) throw Object.assign(new Error('unknown app'), { code: 'EXECUTION_FAILED' }); return a; };
+  const ok = (a, status, h = 'healthy') => ({ health: h, container_ids: [a.current.container], status });
 
-  async function execute(task) {
-    const emit = (type, data) => api.event(task.id, type, data, task.lease_token).catch(() => {});
-    const ctx = { api, docker, cfg, state, save, emit, health, metrics };
+  async function execute(task, leaseLost) {
+    const ctx = { api, docker, cfg, state, save, health, metrics, leaseLost };
     switch (task.type) {
       case 'deploy': case 'update': return deploy(task, ctx);
       case 'rollback': return rollback(task, ctx);
-      case 'restart': { const a = appOf(task); await docker.restart(a.current.container); await emit('service.restarted', { project: task.payload.project }); return { status: 'running' }; }
-      case 'stop': { const a = appOf(task); await docker.stop(a.current.container); await emit('service.stopped', { project: task.payload.project }); return { status: 'stopped' }; }
-      case 'start': { const a = appOf(task); await docker.start(a.current.container); await emit('service.started', { project: task.payload.project }); return { status: 'running' }; }
-      case 'remove': { const p = safeId(task.payload.project); const a = appOf(task); await docker.rm(a.current.container); for (const o of a.previous || []) await docker.rm(o.container).catch(() => {}); delete state.apps[p]; await save(); return { status: 'removed' }; }
-      case 'logs': { const a = appOf(task); return { logs: await docker.logs(a.current.container, Math.min(Number(task.payload.tail) || 200, 2000)) }; }
-      case 'status': { const a = appOf(task); const s = await docker.state(a.current.container); return { version: a.current.version, running: !!s?.Running, status: s?.Status || 'missing' }; }
-      case 'healthcheck': { const a = appOf(task); const h = await (health || (await import('./deploy.js')).httpHealth)(a.current.hostPort, a.current.manifest.healthcheck, { timeoutMs: 5000 }); await emit(h.ok ? 'healthcheck.passed' : 'healthcheck.failed', {}); return { healthy: h.ok, reason: h.reason }; }
-      case 'system-info': return { metrics: await metrics(), apps: Object.keys(state.apps) };
-      default: throw new Error('task type not allowed: ' + task.type);
+      case 'restart': { const a = appOf(task); await docker.restart(a.current.container); return ok(a, 'running'); }
+      case 'stop': { const a = appOf(task); await docker.stop(a.current.container); return ok(a, 'stopped'); }
+      case 'start': { const a = appOf(task); await docker.start(a.current.container); return ok(a, 'running'); }
+      case 'status': { const a = appOf(task); const s = await docker.state(a.current.container); return ok(a, s?.Running ? 'running' : 'stopped', s?.Running ? 'healthy' : 'unhealthy'); }
+      case 'healthcheck': { const a = appOf(task); const h = await health(a.current.hostPort, a.current.manifest.healthcheck, { timeoutMs: 5000 }); return ok(a, 'running', h.ok ? 'healthy' : 'unhealthy'); }
+      case 'system-info': return { health: 'healthy', container_ids: [], status: 'running' };
+      default: throw Object.assign(new Error('task type not allowed: ' + task.type), { code: 'EXECUTION_FAILED' });
     }
   }
 
+  async function applications() {
+    return (await Promise.all(Object.entries(state.apps).map(async ([id, a]) => {
+      if (!a.current) return null; const s = await docker.state(a.current.container);
+      const status = !s ? 'unhealthy' : s.Restarting ? 'crash_loop' : s.Running ? 'running' : 'stopped';
+      return { project_id: id, status };
+    }))).filter(Boolean);
+  }
+  async function heartbeat() {
+    const m = await metrics();
+    await api.heartbeat({ worker_version: version, capabilities: CAPABILITIES, cpu_percent: m.cpu_load_pct ?? 0, memory_free_bytes: m.mem_free, disk_free_bytes: m.disk_free, uptime_seconds: m.uptime_s ?? 0, docker: await docker.available(), applications: await applications() });
+  }
+
+  // Report a finished task. Only a server acknowledgement marks it done; otherwise the result stays pending and is retried (never re-executed).
+  async function flush(id) {
+    const p = state.pending[id]; if (!p) return;
+    try { await (p.kind === 'complete' ? api.complete(id, p.lease, p.result) : api.fail(id, p.lease, p.code, p.rolled_back)); }
+    catch (e) { if (!(e.status === 409 || e.status === 403 || e.status === 404)) return; /* network/5xx: keep pending. Fenced 4xx: lease is gone, drop */ }
+    delete state.pending[id]; state.seen_tasks = [...state.seen_tasks, id].slice(-200); await save();
+  }
+
+  async function runOne(t, lease) {
+    // Never execute unless start was acknowledged.
+    try { await api.start(t.id, lease); } catch (e) { console.error(JSON.stringify({ level: 'warn', msg: 'start not acknowledged, task skipped', task: t.id, error: e.message })); return; }
+    let lost = false;
+    const timer = setInterval(() => { api.renew(t.id, lease).catch((e) => { if (e.status === 403 || e.status === 409 || e.status === 410) lost = true; }); }, cfg.leaseRenewMs || 30000);
+    let out;
+    try { out = { kind: 'complete', result: await execute(t, () => lost) }; }
+    catch (e) { out = { kind: 'fail', code: e.code || 'EXECUTION_FAILED', rolled_back: !!e.rolledBack }; console.error(JSON.stringify({ level: 'warn', msg: 'task failed', task: t.id, code: out.code, error: String(e.message).slice(0, 300) })); }
+    finally { clearInterval(timer); }
+    if (lost) out = { kind: 'fail', code: 'LEASE_EXPIRED', rolled_back: false };
+    state.pending[t.id] = { ...out, lease }; await save(); // persist the outcome BEFORE reporting
+    await flush(t.id);
+  }
+
   async function tick() {
-    if (!hostId) {
-      const r = await api.register({ name: cfg.hostName, host_type: cfg.hostType, worker_version: version, capabilities: TASK_ALLOWLIST, enrollment_token: cfg.enrollmentToken });
-      hostId = r.host_id; state.host_id = hostId; cfg.setToken(r.host_token); state.host_token = r.host_token; await save();
-    }
-    const apps = await docker.list().catch(() => []);
-    await api.heartbeat(hostId, { status: 'online', worker_version: version, metrics: await metrics(), docker: await docker.available(), running_apps: apps.length });
-    const { tasks = [] } = await api.claim(hostId, 2);
-    for (const t of tasks) {
-      if (state.seen_tasks.includes(t.id)) continue; // idempotent after worker restart
-      await api.start(t.id, t.lease_token).catch(() => {});
-      try { const result = await execute(t); await api.complete(t.id, result, t.lease_token); }
-      catch (e) { await api.fail(t.id, { message: e.message, logs: e.logs }, t.lease_token).catch(() => {}); }
-      state.seen_tasks = [...state.seen_tasks, t.id].slice(-200); await save();
+    for (const id of Object.keys(state.pending)) await flush(id);
+    await heartbeat();
+    for (let i = 0; i < (cfg.maxPerTick || 3); i++) { // one task per claim request
+      const r = await api.claim(); const t = r && r.task; if (!t) break;
+      if (state.seen_tasks.includes(t.id) || state.pending[t.id]) break;
+      await runOne(t, r.lease_token || t.lease_token);
     }
   }
 

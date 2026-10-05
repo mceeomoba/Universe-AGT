@@ -1,21 +1,23 @@
 # Host worker (Apex half)
 
-Outbound-only worker for a persistent host. No inbound ports, no Tailscale, no dependency on any agent VM.
+Outbound-only worker for a persistent host. No inbound ports, no Tailscale, no dependency on any agent VM. Implements Worker protocol v1 (`control-plane-contract.md`).
 
-## Contract used (Vertex control plane, outbound HTTPS REST)
-- `POST /v1/hosts/register` (enrollment token) returns `host_id`, `host_token`.
-- `POST /v1/hosts/:id/heartbeat` status, CPU/RAM/disk, Docker state, worker version, running app count.
-- `POST /v1/hosts/:id/tasks/claim` returns tasks with a fenced `lease_token` and `lease_expires_at`.
-- `POST /v1/tasks/:id/start|complete|fail` every mutation carries `lease_token`.
-- `GET /v1/artifacts/:id` (sha256, size) and `GET /v1/artifacts/:id/download` (signed URL). The worker verifies SHA-256 before use.
-- `GET /v1/deployments/:id/secrets` returns runtime env only when the task payload sets `has_secrets`. Secrets are never logged.
-- Event posts (`POST /v1/tasks/:id/events`) and `POST /v1/deployments/report` are best-effort and still to be agreed with the control plane.
+## Provisioning
+No anonymous enrollment. The operator registers the host and issues a host credential, then installs `AGENT_HOST_CONTROL_PLANE`, `AGENT_HOST_ID`, `AGENT_HOST_TOKEN` (read from the environment by `scripts/install-host.sh`, written to a 0600 env file, never logged).
 
-## Task types (allowlist)
-deploy, update, restart, stop, start, remove, rollback, logs, status, healthcheck, system-info. Anything else is refused. Docker is called with an argv allowlist, never through a shell.
+## Loop
+heartbeat (flat body: version, capabilities, cpu/mem/disk, uptime, docker, applications) then claim (one task per request) then `start` (task is skipped if start is rejected) then execute while renewing the lease every 30s then `complete {lease_token,result}` or `fail {lease_token,code,rolled_back}` (codes only, no logs or free text).
+
+## Safety rules
+- Never execute after a failed `start`. If renewal fails, side effects stop (`LEASE_EXPIRED`).
+- The outcome is saved locally before it is reported and is only marked done after the server acknowledges. An unacknowledged result is retried, never re-executed.
+- Before repeating a deployment, the worker checks Docker for the same deployment already running and reports it instead of rebuilding.
+- Only advertised task types run: deploy, update, start, stop, restart, rollback, status, healthcheck, system-info. Docker is called with an argv allowlist, never through a shell.
+- Artifacts: download_url fetched directly, size and SHA-256 verified, archives with links, special files or traversal are rejected before extraction.
+- Secrets and domains are not implemented (disabled by contract).
 
 ## Deploy flow
-claim, download, verify checksum, safe-extract, validate `agent.deploy.json`, capacity check, build, run on a unique container name bound to 127.0.0.1, health check, switch. On any failure the new container is removed and the previous version keeps running. The previous version is kept stopped so rollback is instant.
+claim, fetch artifact, verify, safe-extract, validate `agent.deploy.json`, capacity check, build, run on a unique container bound to 127.0.0.1, health check, switch. Any failure removes the new container and the previous version keeps running (`rolled_back:true`). The previous version is kept stopped so rollback is instant.
 
 ## Tests
-`cd host-worker && npm test` runs against a fake control plane and fake Docker. Real Docker, reboot survival and the Grok VM are not proven by these tests.
+`cd host-worker && npm test` (fake control plane, fake Docker) plus a real-Docker smoke test in CI. Not proven: reboot survival and the Grok VM.

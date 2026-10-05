@@ -1,7 +1,7 @@
 // Deployment engine (spec sections 7, 9, 14, 19). Never leaves a broken partial deploy: on any failure the previous version keeps running.
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
@@ -30,68 +30,78 @@ export async function httpHealth(port, hcPath, { timeoutMs = 60000, intervalMs =
   return { ok: false, reason: last };
 }
 
+const fail = (code, msg, extra = {}) => Object.assign(new Error(msg), { code, ...extra });
+const UUIDISH = /^[0-9a-fA-F-]{8,64}$/;
+// Reject symlinks, hardlinks, special files and traversal BEFORE extracting (contract: artifacts).
+export async function inspectArchive(tarball) {
+  const verbose = (await sh('tar', ['-tvzf', tarball])).split('\n').filter(Boolean);
+  for (const l of verbose) { const t = l[0]; if (t !== '-' && t !== 'd') throw fail('ARTIFACT_INVALID', 'artifact contains links or special files'); }
+  const names = (await sh('tar', ['-tzf', tarball])).split('\n').filter(Boolean);
+  if (names.some((n) => n.startsWith('/') || n.split('/').includes('..'))) throw fail('ARTIFACT_INVALID', 'artifact contains unsafe paths');
+}
+
 export async function deploy(task, ctx) {
-  const { api, docker, cfg, state, save, emit, health = httpHealth, metrics } = ctx;
+  const { api, docker, cfg, state, save, health = httpHealth, metrics, leaseLost = () => false } = ctx;
   const p = task.payload || {};
-  const project = safeId(p.project || ''), version = String(p.version || '').replace(/[^A-Za-z0-9._-]/g, '');
-  if (!project || !version || !p.artifact_id) throw new Error('deploy payload needs project, version, artifact_id');
+  const projectId = safeId(p.project_id || ''), version = String(p.version || '').replace(/[^A-Za-z0-9._-]/g, '');
   const deployId = safeId(p.deployment_id || task.id);
-  const dir = path.join(cfg.appsDir, project, version);
-  const tarball = path.join(cfg.cacheDir, `${project}-${version}-${deployId}.tgz`);
-  const image = `agent-app/${project}:${version}`;
-  const name = `app-${project}-${deployId.slice(0, 12)}`;
+  if (!UUIDISH.test(String(p.project_id || '')) || !version || !p.artifact_id) throw fail('EXECUTION_FAILED', 'deploy payload needs project_id, version, artifact_id');
+  // Reconcile before repeating an uncertain operation: this deployment already live => report it, do not rebuild.
+  const cur = state.apps[projectId]?.current;
+  if (cur && cur.deployment === deployId && (await docker.state(cur.container))?.Running) return { deployment_id: p.deployment_id, health: 'healthy', container_ids: [cur.container], status: 'running' };
+  const dir = path.join(cfg.appsDir, projectId, version);
+  const tarball = path.join(cfg.cacheDir, `${projectId}-${version}-${deployId}.tgz`);
+  const image = `agent-app/${projectId}:${version}`;
+  const name = `app-${projectId}-${deployId}`;
   let started = false;
   try {
-    await emit('deployment.started', { project, version });
-    const meta = await api.artifactMeta(p.artifact_id);
+    const meta = await api.artifact(p.artifact_id);
     await mkdir(cfg.cacheDir, { recursive: true });
-    const res = await api.artifactDownload(p.artifact_id);
-    await pipeline(Readable.fromWeb(res.body), createWriteStream(tarball));
+    try { const res = await api.download(meta.download_url); await pipeline(Readable.fromWeb(res.body), createWriteStream(tarball)); }
+    catch (e) { throw fail('ARTIFACT_INVALID', 'artifact download failed: ' + e.message); }
+    const { size } = await stat(tarball);
+    if (meta.artifact.size != null && Number(meta.artifact.size) !== size) throw fail('ARTIFACT_INVALID', 'artifact size mismatch');
     const sum = await sha256File(tarball);
-    if (!meta.checksum || sum !== String(meta.checksum).toLowerCase()) throw new Error('checksum mismatch: artifact rejected');
-    const names = (await sh('tar', ['-tzf', tarball])).split('\n').filter(Boolean);
-    if (names.some((n) => n.startsWith('/') || n.split('/').includes('..'))) throw new Error('artifact contains unsafe paths');
+    if (!meta.artifact.checksum || sum !== String(meta.artifact.checksum).toLowerCase()) throw fail('ARTIFACT_INVALID', 'checksum mismatch: artifact rejected');
+    await inspectArchive(tarball);
     await rm(dir, { recursive: true, force: true }); await mkdir(dir, { recursive: true });
-    await sh('tar', ['-xzf', tarball, '-C', dir, '--no-same-owner']);
-    const manifest = validateManifest(await readFile(path.join(dir, 'agent.deploy.json'), 'utf8'));
-    if (manifest.name !== project) throw new Error('manifest name does not match project');
+    await sh('tar', ['-xzf', tarball, '-C', dir, '--no-same-owner', '--no-same-permissions']);
+    let manifest; try { manifest = validateManifest(await readFile(path.join(dir, 'agent.deploy.json'), 'utf8')); } catch (e) { throw fail('MANIFEST_INVALID', e.message); }
     const cap = checkCapacity(await metrics(), { memory: manifest.memory, disk: manifest.disk });
-    if (cap) throw new Error(cap);
-    const secrets = p.has_secrets ? (await api.secrets(deployId)).env || {} : {};
-    await docker.build(image, dir, path.join(dir, manifest.dockerfile));
+    if (cap) throw fail('INSUFFICIENT_RESOURCES', cap);
+    if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before build');
+    try { await docker.build(image, dir, path.join(dir, manifest.dockerfile)); } catch (e) { throw fail('BUILD_FAILED', e.message); }
+    if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before run');
     const hostPort = pickPort(state);
-    await docker.run({ name, image, project, deployment: deployId, version, hostPort, port: manifest.port, memory: manifest.memory, cpu: manifest.cpu, restart: manifest.restart, env: secrets });
+    await docker.run({ name, image, project: projectId, deployment: deployId, version, hostPort, port: manifest.port, memory: manifest.memory, cpu: manifest.cpu, restart: manifest.restart, env: {} });
     started = true;
     const h = await health(hostPort, manifest.healthcheck);
-    if (!h.ok) { await emit('healthcheck.failed', { reason: h.reason }); throw new Error('health check failed: ' + h.reason); }
-    await emit('healthcheck.passed', { project, version });
-    const app = state.apps[project] || { previous: [] };
+    if (!h.ok) throw fail('HEALTH_FAILED', 'health check failed: ' + h.reason);
+    if (leaseLost()) throw fail('LEASE_EXPIRED', 'lease lost before switch');
+    const app = state.apps[projectId] || { previous: [] };
     const old = app.current;
     app.current = { version, container: name, image, hostPort, deployment: deployId, manifest, at: new Date().toISOString() };
     app.previous = [...(old ? [old] : []), ...(app.previous || [])].slice(0, 3);
-    state.apps[project] = app; await save();
-    if (old) { await docker.stop(old.container).catch(() => {}); } // old kept stopped (not removed) so rollback is instant
-    await emit('deployment.completed', { project, version, container: name });
-    return { project, version, status: 'running', health: 'healthy', container: name, host_port: hostPort, domains: manifest.domains };
+    state.apps[projectId] = app; await save();
+    if (old) await docker.stop(old.container).catch(() => {}); // old kept stopped so rollback is instant
+    return { deployment_id: p.deployment_id, health: 'healthy', container_ids: [name], status: 'running' };
   } catch (e) {
-    let logs = ''; if (started) { logs = await docker.logs(name, 100).catch(() => ''); await docker.rm(name).catch(() => {}); }
+    if (started) await docker.rm(name).catch(() => {});
     await docker.rmi(image).catch(() => {});
-    await emit('deployment.failed', { project, version, error: e.message, rolled_back: !!state.apps[project]?.current, previous_still_running: !!state.apps[project]?.current });
-    e.logs = logs.slice(-2000); throw e;
+    e.code = e.code || 'EXECUTION_FAILED'; e.rolledBack = !!state.apps[projectId]?.current; throw e;
   } finally { await rm(tarball, { force: true }); }
 }
 
 export async function rollback(task, ctx) {
-  const { docker, state, save, emit, health = httpHealth } = ctx; const project = safeId(task.payload?.project || '');
-  const app = state.apps[project]; if (!app || !app.previous?.length) throw new Error('no previous version to roll back to');
+  const { docker, state, save, health = httpHealth } = ctx; const projectId = safeId(task.payload?.project_id || '');
+  const app = state.apps[projectId]; if (!app || !app.previous?.length) throw fail('EXECUTION_FAILED', 'no previous version to roll back to');
   const prev = app.previous[0], cur = app.current;
-  const name = `app-${project}-rb${Date.now().toString(36)}`;
-  await docker.run({ name, image: prev.image, project, deployment: prev.deployment, version: prev.version, hostPort: prev.hostPort, port: prev.manifest.port, memory: prev.manifest.memory, cpu: prev.manifest.cpu, restart: prev.manifest.restart, env: {} });
+  const name = `app-${projectId}-rb${Date.now().toString(36)}`;
+  await docker.run({ name, image: prev.image, project: projectId, deployment: prev.deployment, version: prev.version, hostPort: prev.hostPort, port: prev.manifest.port, memory: prev.manifest.memory, cpu: prev.manifest.cpu, restart: prev.manifest.restart, env: {} });
   const h = await health(prev.hostPort, prev.manifest.healthcheck);
-  if (!h.ok) { await docker.rm(name).catch(() => {}); throw new Error('rollback target unhealthy: ' + h.reason); }
+  if (!h.ok) { await docker.rm(name).catch(() => {}); throw fail('HEALTH_FAILED', 'rollback target unhealthy: ' + h.reason); }
   if (cur) await docker.rm(cur.container).catch(() => {});
   await docker.rm(prev.container).catch(() => {});
   app.current = { ...prev, container: name }; app.previous = app.previous.slice(1); await save();
-  await emit('deployment.completed', { project, version: prev.version, rollback: true });
-  return { project, version: prev.version, status: 'running', rolled_back_from: cur?.version };
+  return { deployment_id: task.payload?.deployment_id, health: 'healthy', container_ids: [name], status: 'rolled_back' };
 }

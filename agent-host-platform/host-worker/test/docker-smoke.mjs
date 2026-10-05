@@ -11,15 +11,16 @@ function artifact(name, healthy) {
   const buf = readFileSync(tgz); return { buf, checksum: createHash('sha256').update(buf).digest('hex') };
 }
 const arts = { good: artifact('smoke', true), bad: artifact('smoke', false) };
-const api = { artifactMeta: async (id) => ({ checksum: arts[id].checksum }), artifactDownload: async (id) => new Response(arts[id].buf), secrets: async () => ({ env: {} }) };
+const api = { artifact: async (id) => ({ artifact: { checksum: arts[id].checksum, size: arts[id].buf.length }, download_url: 'x:' + id }), download: async (u) => new Response(arts[u.slice(2)].buf) };
+const PID = 'aaaaaaaa-0000-4000-8000-0000000000aa';
 const root = mkdtempSync(path.join(os.tmpdir(), 'root-')); const cfg = { appsDir: root + '/apps', cacheDir: root + '/cache' };
 const docker = makeDocker(); const state = { apps: {}, seen_tasks: [] }; const events = [];
 const ctx = { api, docker, cfg, state, save: async () => {}, emit: async (t) => events.push(t), metrics: systemMetrics };
 try {
-  const r1 = await deploy({ id: 'd1', payload: { project: 'smoke', version: '1', artifact_id: 'good', deployment_id: 'd1' } }, ctx);
-  assert.equal(r1.health, 'healthy'); const c1 = state.apps.smoke.current.container;
+  const r1 = await deploy({ id: 'd1', payload: { project_id: PID, version: '1', artifact_id: 'good', deployment_id: 'd1' } }, ctx);
+  assert.equal(r1.health, 'healthy'); const c1 = state.apps[PID].current.container;
   const { httpHealth } = await import('../src/deploy.js');
-  await assert.rejects(deploy({ id: 'd2', payload: { project: 'smoke', version: '2', artifact_id: 'bad', deployment_id: 'd2' } }, { ...ctx, health: (p, h) => httpHealth(p, h, { timeoutMs: 8000, intervalMs: 1000 }) }), /health check failed/);
+  await assert.rejects(deploy({ id: 'd2', payload: { project_id: PID, version: '2', artifact_id: 'bad', deployment_id: 'd2' } }, { ...ctx, health: (p, h) => httpHealth(p, h, { timeoutMs: 8000, intervalMs: 1000 }) }), /health check failed/);
   const st = await docker.state(c1); assert.equal(st.Running, true, 'v1 must keep running after failed v2');
   console.log('DOCKER SMOKE PASS', events.join(','));
 } finally { for (const c of await docker.list()) await docker.rm(c.Names).catch(() => {}); }
