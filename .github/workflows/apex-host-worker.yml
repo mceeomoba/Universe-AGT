@@ -70,6 +70,38 @@ jobs:
           tar xzf p.tgz
           diff -r "$GITHUB_WORKSPACE/agent-host-platform/host-worker" host-worker
           cd host-worker && npm test
+  installer-e2e-container:
+    needs: unpack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: start fake control plane (records bearer SHA-256 only)
+        run: |
+          rm -f /tmp/plane.log; touch /tmp/plane.log
+          nohup node agent-host-platform/host-worker/test/fake-plane.mjs 18081 /tmp/plane.log >/tmp/plane.out 2>&1 &
+          sleep 2
+      - name: install in a privileged container without systemd (supervisor mode)
+        run: |
+          docker run --privileged --network host -v "$PWD:/src:ro" -w /src ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null
+            bash agent-host-platform/scripts/install-host-standalone.sh diagnose --control-plane http://127.0.0.1:18081 || true
+            bash agent-host-platform/scripts/install-host-standalone.sh install --control-plane http://127.0.0.1:18081 --host-id ci-container 2>&1 | tee /tmp/install.out
+            grep -q "run mode: supervisor" /tmp/install.out
+            grep -q "using embedded worker source" /tmp/install.out
+            bash agent-host-platform/scripts/install-host-standalone.sh status
+          '
+      - name: verify supervised heartbeats reached the control plane
+        run: |
+          n=0
+          for i in $(seq 1 20); do n=$(grep -c '/heartbeat' /tmp/plane.log); [ "$n" -ge 2 ] && break; sleep 3; done
+          [ "$n" -ge 2 ] && echo "supervised worker heartbeats: $n"
   installer-e2e:
     needs: unpack
     runs-on: ubuntu-latest
