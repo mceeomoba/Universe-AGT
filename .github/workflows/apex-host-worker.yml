@@ -2,7 +2,7 @@ name: apex-host-worker
 on:
   workflow_dispatch:
   push:
-    paths: ['apex-src.b64.txt', 'apex-ci-update.txt', 'agent-host-platform/host-worker/**', 'agent-host-platform/scripts/install-host.sh']
+    paths: ['apex-src.b64.txt', 'apex-ci-update.txt', 'agent-host-platform/host-worker/**', 'agent-host-platform/scripts/**']
 permissions:
   contents: write
 concurrency:
@@ -45,6 +45,31 @@ jobs:
       - name: real docker smoke (build + run + health + rollback path)
         working-directory: agent-host-platform/host-worker
         run: node test/docker-smoke.mjs
+  standalone:
+    needs: unpack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: standalone installer is fresh and its payload is the committed worker
+        working-directory: agent-host-platform
+        run: |
+          bash -n scripts/install-host-standalone.sh
+          bash -n scripts/embed-worker-source.sh
+          bash scripts/embed-worker-source.sh /tmp/regen.sh
+          cmp /tmp/regen.sh scripts/install-host-standalone.sh && echo "standalone up to date"
+          B64=$(grep "^EMBEDDED_WORKER_B64=" scripts/install-host-standalone.sh | cut -d"'" -f2)
+          SHA=$(grep "^EMBEDDED_SHA256=" scripts/install-host-standalone.sh | cut -d"'" -f2)
+          mkdir -p /tmp/emb && cd /tmp/emb
+          printf '%s' "$B64" | base64 -d > p.tgz
+          echo "$SHA  p.tgz" | sha256sum -c -
+          tar xzf p.tgz
+          diff -r "$GITHUB_WORKSPACE/agent-host-platform/host-worker" host-worker
+          cd host-worker && npm test
   installer-e2e:
     needs: unpack
     runs-on: ubuntu-latest
@@ -85,6 +110,12 @@ jobs:
           test "$(sudo stat -c %U /opt/agent-host/config/host.token)" = agent-host
           sudo systemctl show agent-host-worker -p Restart | grep -q Restart=always
           echo "credential handling PASS"
+      - name: reinstall from standalone installer (embedded source, keeps credential)
+        run: |
+          sudo bash agent-host-platform/scripts/install-host-standalone.sh install --control-plane http://127.0.0.1:18080 --host-id ci-host | tee /tmp/install2.out
+          grep -q "using embedded worker source" /tmp/install2.out
+          grep -q "keeping existing host credential" /tmp/install2.out
+          systemctl is-active agent-host-worker.service
       - name: status command is redacted
         run: sudo bash agent-host-platform/scripts/install-host.sh status
       - name: cleanup
