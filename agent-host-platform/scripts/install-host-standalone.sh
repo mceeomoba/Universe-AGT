@@ -34,8 +34,11 @@ diagnose() {
   case "${ID:-}${ID_LIKE:-}" in *debian*|*ubuntu*) log "distro: supported (Debian/Ubuntu family)";; *) log "distro: NOT supported yet"; bad=1;; esac
   case "$(uname -m)" in x86_64|aarch64|arm64) log "CPU: supported";; *) log "CPU: NOT supported"; bad=1;; esac
   if [ "$(id -u)" -eq 0 ]; then log "privileges: root"; elif sudo -n true 2>/dev/null; then log "privileges: sudo works"; else log "privileges: need root (run with sudo)"; bad=1; fi
-  if [ -d /run/systemd/system ]; then log "systemd: yes"; else log "systemd: NOT running (required)"; bad=1; fi
-  if command -v docker >/dev/null 2>&1; then if docker info >/dev/null 2>&1; then log "docker: installed and running"; else log "docker: installed but not reachable (installer will try to start it)"; fi; else log "docker: not installed (installer will install docker.io)"; fi
+  INIT1="$(cat /proc/1/comm 2>/dev/null || echo unknown)"
+  if [ -d /run/systemd/system ]; then log "init: systemd (service mode)"; else log "init: PID 1 is '$INIT1', no systemd - container-style box; the worker runs under a supervisor loop instead"; fi
+  if command -v crontab >/dev/null 2>&1; then log "cron: yes (worker can restart after reboot via @reboot)"; else log "cron: NO (no automatic restart after a reboot; a reboot means re-running the install or the supervisor by hand)"; fi
+  { [ -f /.dockerenv ] || [ -f /run/.containerenv ]; } && log "container marker: yes (this is a container, not a full VM; Docker-in-container needs privilege or a mounted socket)" || true
+  if command -v docker >/dev/null 2>&1; then if docker info >/dev/null 2>&1; then log "docker: installed and running"; elif [ -S /var/run/docker.sock ]; then log "docker: CLI present, socket exists but not usable by this user (permissions?)"; else log "docker: installed but not running (installer will try to start dockerd; inside a container that needs privileges)"; fi; else log "docker: not installed (installer will install docker.io; inside a container it also needs privileges to run)"; fi
   command -v node >/dev/null 2>&1 && log "system node: $(node -v) (ignored; the installer uses its own private Node 22)" || log "system node: none (fine)"
   log "free disk /opt: $(df -h /opt 2>/dev/null | awk 'NR==2{print $4}')   RAM: $(awk '/MemTotal/{printf "%.1f GB", $2/1048576}' /proc/meminfo)"
   log "network triage (curl only, 10s cap per probe, no ping needed)"
@@ -64,10 +67,19 @@ install_cmd() {
   local NA; NA="$(nodearch)"; . /etc/os-release 2>/dev/null || true
   case "${ID:-}${ID_LIKE:-}" in *debian*|*ubuntu*) ;; *) die "only Debian/Ubuntu are supported right now";; esac
   export DEBIAN_FRONTEND=noninteractive
+  local MODE=supervisor; [ -d /run/systemd/system ] && MODE=systemd
+  log "run mode: $MODE (PID 1 is '$(cat /proc/1/comm 2>/dev/null || echo unknown)')"
   log "installing base packages"; apt-get update -y >/dev/null; apt-get install -y ca-certificates curl tar xz-utils >/dev/null
   command -v docker >/dev/null 2>&1 || { log "installing Docker"; apt-get install -y docker.io >/dev/null; }
-  systemctl enable --now docker >/dev/null 2>&1 || true
-  docker info >/dev/null 2>&1 || die "Docker is installed but not running"
+  if ! docker info >/dev/null 2>&1; then
+    if [ "$MODE" = systemd ]; then systemctl enable --now docker >/dev/null 2>&1 || true
+    elif command -v dockerd >/dev/null 2>&1; then
+      log "no systemd: starting dockerd directly (logs in $ROOT/logs/dockerd.log)"; mkdir -p "$ROOT/logs"
+      ( setsid dockerd >>"$ROOT/logs/dockerd.log" 2>&1 < /dev/null & )
+      local i; for i in $(seq 1 15); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    fi
+  fi
+  docker info >/dev/null 2>&1 || die "Docker is not running and could not be started. Inside a container it needs privileges (or a mounted /var/run/docker.sock). Without Docker the worker can install but cannot run deployments."
   id "$SVC_USER" >/dev/null 2>&1 || useradd --system --home "$ROOT" --shell /usr/sbin/nologin "$SVC_USER"
   usermod -aG docker "$SVC_USER"
   mkdir -p "$ROOT"/{worker,config,logs,cache,runtime,node} "$APPS"
@@ -115,7 +127,36 @@ AGENT_APPS_DIR=$APPS
 AGENT_HOST_TOKEN_FILE=$TF
 ENV
   chmod 644 "$ROOT/config/worker.env"; chown -R "$SVC_USER:$SVC_USER" "$ROOT" "$APPS"; chmod 600 "$TF"
-  install -m 644 "$ROOT/worker/systemd/agent-host-worker.service" /etc/systemd/system/agent-host-worker.service; systemctl daemon-reload
+  if [ "$MODE" = systemd ]; then
+    install -m 644 "$ROOT/worker/systemd/agent-host-worker.service" /etc/systemd/system/agent-host-worker.service; systemctl daemon-reload
+    echo systemd > "$ROOT/config/run-mode"
+  else
+    cat > "$ROOT/supervise.sh" <<'SUP'
+#!/usr/bin/env bash
+# Restart-on-crash supervisor for the host worker (used on hosts without systemd).
+set -u
+ROOT=/opt/agent-host; SVC_USER=agent-host
+mkdir -p "$ROOT/runtime" "$ROOT/logs"
+echo $$ > "$ROOT/runtime/supervisor.pid"
+backoff=1
+while :; do
+  start_ts=$(date +%s)
+  runuser -u "$SVC_USER" -- bash -c 'set -a; . /opt/agent-host/config/worker.env; set +a; exec /opt/agent-host/node/bin/node /opt/agent-host/worker/src/index.js' >> "$ROOT/logs/worker.log" 2>&1
+  rc=$?
+  now=$(date +%s); [ $((now - start_ts)) -gt 60 ] && backoff=1
+  printf '%s worker exited (code %s), restarting in %ss
+' "$(date -Is)" "$rc" "$backoff" >> "$ROOT/logs/supervisor.log"
+  sleep "$backoff"; backoff=$(( backoff < 60 ? backoff * 2 : 60 ))
+done
+SUP
+    chmod 755 "$ROOT/supervise.sh"; echo supervisor > "$ROOT/config/run-mode"
+    if command -v crontab >/dev/null 2>&1; then
+      ( crontab -l 2>/dev/null | grep -v 'agent-host/supervise.sh' || true; echo '@reboot /opt/agent-host/supervise.sh' ) | crontab -
+      log "registered cron @reboot so the worker restarts after a reboot"
+    else
+      log "no cron on this box: after a reboot the worker does NOT restart by itself (re-run this install or: sudo setsid bash $ROOT/supervise.sh >/dev/null 2>&1 &)"
+    fi
+  fi
   echo; log "HOST ID:        $HOST_ID"; log "token sha256:   $DIGEST"
   log "Give the operator the two lines above so the control plane can accept this host. The credential itself never leaves this machine."
 
@@ -132,7 +173,14 @@ ENV
 }
 
 status_cmd() {
-  need_root; systemctl is-active agent-host-worker.service || true; journalctl -u agent-host-worker -n 15 --no-pager 2>/dev/null | redact || true
+  need_root
+  if [ "$(cat "$ROOT/config/run-mode" 2>/dev/null)" = supervisor ]; then
+    local SPID=""; [ -s "$ROOT/runtime/supervisor.pid" ] && SPID="$(cat "$ROOT/runtime/supervisor.pid")"
+    if [ -n "$SPID" ] && kill -0 "$SPID" 2>/dev/null; then log "supervisor: running (pid $SPID)"; else log "supervisor: NOT running"; fi
+    tail -n 10 "$ROOT/logs/supervisor.log" "$ROOT/logs/worker.log" 2>/dev/null | redact || true
+  else
+    systemctl is-active agent-host-worker.service || true; journalctl -u agent-host-worker -n 15 --no-pager 2>/dev/null | redact || true
+  fi
   runuser -u "$SVC_USER" -- bash -c "set -a; . $ROOT/config/worker.env; set +a; exec $ROOT/node/bin/node $ROOT/worker/src/index.js --check" 2>&1 | redact || true
 }
 

@@ -27,6 +27,10 @@ heartbeat (flat body: version, capabilities, cpu/mem/disk, uptime, docker, appli
 - Secrets: only when the task lists `secret_refs`; fetched with the fenced `POST /v1/tasks/:id/secrets`, passed to `docker run` through a 0600 env-file deleted immediately (never argv), never logged, persisted or returned. Missing/denied secrets fail closed. Rollback restarts the retained previous container so secrets are not re-fetched or stored. Domains are not implemented.
 - Lease loss: a fenced 403/409/410 on renew, or no successful renewal for 75s (prolonged outage), stops further side effects (checked before build, run, switch, rollback and control commands) and reports `LEASE_EXPIRED`.
 
+
+## Container hosts without systemd
+On a box where PID 1 is not systemd (Grok VM and similar containers), the installer switches to supervisor mode: `supervise.sh` runs the worker under `setsid` with a pidfile and restart-on-crash backoff (1s doubling to 60s, reset after a stable minute). Logs land in `/opt/agent-host/logs/`. Reboot restart uses cron `@reboot` when cron exists; if the box has no cron, the worker does NOT restart by itself after a reboot (re-run the install or start `supervise.sh` by hand). Docker still required for deployments: with no systemd the installer starts `dockerd` directly, which needs container privileges or a mounted `/var/run/docker.sock`; if Docker cannot run, install stops with a clear error. `diagnose` reports the init system, cron, container markers, Docker CLI/socket state, user/sudo, and per-host DNS/TCP/TLS curl probes (no ping needed).
+
 ## Deploy flow
 claim, fetch artifact, verify, safe-extract, validate `agent.deploy.json`, capacity check, build, run on a unique container bound to 127.0.0.1, health check, switch. Any failure removes the new container and the previous version keeps running (`rolled_back:true`). The previous version is kept stopped so rollback is instant.
 
