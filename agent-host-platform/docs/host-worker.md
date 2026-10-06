@@ -5,6 +5,16 @@ Outbound-only worker for a persistent host. No inbound ports, no Tailscale, no d
 ## Provisioning
 No anonymous enrollment. The operator registers the host and issues a host credential, then installs `AGENT_HOST_CONTROL_PLANE`, `AGENT_HOST_ID`, `AGENT_HOST_TOKEN` (read from the environment by `scripts/install-host.sh`, written to a 0600 env file, never logged).
 
+
+## Installing without GitHub access (restricted egress)
+`scripts/embed-worker-source.sh` generates `scripts/install-host-standalone.sh`: the same installer with the worker source embedded as a sha256-verified tarball, regenerated deterministically and checked in CI. Install with `sudo bash install-host-standalone.sh install --control-plane URL --host-id ID` (no `--ref`, no GitHub fetch). Everything else is identical, including credential handling and the authenticated pre-flight heartbeat.
+
+Hosts the install and worker actually need (diagnose probes each and labels it):
+- Required: the control-plane URL, and nodejs.org (private Node 22 download).
+- apt mirrors (archive.ubuntu.com / deb.debian.org) and registry-1.docker.io for packages and app images; any HTTP code, even 401/403, means reachable.
+- codeload.github.com / raw.githubusercontent.com: only for the non-standalone installer.
+- Worker runtime after install: the control-plane URL only (plus the Docker registry when deploying apps).
+
 ## Loop
 heartbeat (flat body: version, capabilities, cpu/mem/disk, uptime, docker, applications) then claim (one task per request) then `start` (task is skipped if start is rejected) then execute while renewing the lease every 30s then `complete {lease_token,result}` or `fail {lease_token,code,rolled_back}` (codes only, no logs or free text).
 
