@@ -88,20 +88,22 @@ jobs:
       - name: install in a privileged container without systemd (supervisor mode)
         run: |
           docker run --privileged --network host -v "$PWD:/src:ro" -w /src ubuntu:24.04 bash -c '
-            set -e
+            set -eo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq >/dev/null
             bash agent-host-platform/scripts/install-host-standalone.sh diagnose --control-plane http://127.0.0.1:18081 || true
             bash agent-host-platform/scripts/install-host-standalone.sh install --control-plane http://127.0.0.1:18081 --host-id ci-container 2>&1 | tee /tmp/install.out
             grep -q "run mode: supervisor" /tmp/install.out
             grep -q "using embedded worker source" /tmp/install.out
-            bash agent-host-platform/scripts/install-host-standalone.sh status
+            grep -q "DONE: worker running and authenticated under the supervisor" /tmp/install.out
+            bash agent-host-platform/scripts/install-host-standalone.sh status | tee /tmp/status.out
+            grep -q "supervisor: running" /tmp/status.out
           '
       - name: verify supervised heartbeats reached the control plane
         run: |
           n=0
-          for i in $(seq 1 20); do n=$(grep -c '/heartbeat' /tmp/plane.log); [ "$n" -ge 2 ] && break; sleep 3; done
-          [ "$n" -ge 2 ] && echo "supervised worker heartbeats: $n"
+          for i in $(seq 1 30); do n=$(grep -c '/heartbeat' /tmp/plane.log); [ "$n" -ge 3 ] && break; sleep 3; done
+          [ "$n" -ge 3 ] && echo "heartbeats (install check + status check + live supervised worker): $n"
   installer-e2e:
     needs: unpack
     runs-on: ubuntu-latest
