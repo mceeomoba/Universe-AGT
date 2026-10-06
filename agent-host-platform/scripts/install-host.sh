@@ -43,7 +43,7 @@ diagnose() {
   log "free disk /opt: $(df -h /opt 2>/dev/null | awk 'NR==2{print $4}')   RAM: $(awk '/MemTotal/{printf "%.1f GB", $2/1048576}' /proc/meminfo)"
   log "network triage (curl only, 10s cap per probe, no ping needed)"
   probe() { local u="$1" why="$2" r; r=$(curl -sS -o /dev/null -w 'http=%{http_code} dns=%{time_namelookup}s tcp=%{time_connect}s tls=%{time_appconnect}s' --max-time 10 "$u" 2>&1 || true); [ -z "$r" ] && r="fail (no reply within 10s)"; log "probe $u: $r  [$why]"; case "$r" in http=*) return 0;; *) return 1;; esac; }
-  local cphost; cphost=$(printf '%s' "${CP:-https://supabase.co}" | sed -E 's|https?://([^/]+).*|\1|')
+  local cphost; cphost=$(printf '%s' "${CP:-https://supabase.co}" | sed -E 's|https?://||; s|[:/].*||')
   for h in nodejs.org github.com "$cphost"; do getent hosts "$h" >/dev/null 2>&1 && log "dns $h: resolves" || log "dns $h: FAIL (name resolution broken for this host)"; done
   if command -v curl >/dev/null 2>&1; then
     probe https://1.1.1.1 "raw egress without DNS; any http line means outbound internet works" || true
@@ -137,6 +137,8 @@ ENV
 set -u
 ROOT=/opt/agent-host; SVC_USER=agent-host
 mkdir -p "$ROOT/runtime" "$ROOT/logs"
+exec 9> "$ROOT/runtime/supervisor.lock"
+flock -n 9 || { printf '%s another supervisor already holds the lock, exiting\n' "$(date -Is)" >> "$ROOT/logs/supervisor.log"; exit 0; }
 echo $$ > "$ROOT/runtime/supervisor.pid"
 backoff=1
 while :; do
@@ -167,9 +169,21 @@ SUP
     die "the control plane did not accept the heartbeat. Once the operator has registered the digest above, run this same install command again."
   fi
   printf '%s\n' "$out" | redact
-  systemctl enable --now agent-host-worker.service; sleep 3
-  systemctl is-active --quiet agent-host-worker.service || { journalctl -u agent-host-worker -n 30 --no-pager | redact; die "service failed to start"; }
-  log "DONE: worker running and authenticated. It restarts on crash and after reboot."
+  if [ "$MODE" = systemd ]; then
+    systemctl enable --now agent-host-worker.service; sleep 3
+    systemctl is-active --quiet agent-host-worker.service || { journalctl -u agent-host-worker -n 30 --no-pager | redact; die "service failed to start"; }
+    log "DONE: worker running and authenticated. It restarts on crash and after reboot."
+  else
+    [ -s "$ROOT/runtime/supervisor.pid" ] && kill "$(cat "$ROOT/runtime/supervisor.pid")" 2>/dev/null || true
+    pkill -f 'agent-host/worker/src/index.js' 2>/dev/null || true
+    sleep 1
+    setsid bash "$ROOT/supervise.sh" >/dev/null 2>&1 < /dev/null &
+    sleep 3
+    local SPID=""; [ -s "$ROOT/runtime/supervisor.pid" ] && SPID="$(cat "$ROOT/runtime/supervisor.pid")"
+    [ -n "$SPID" ] && kill -0 "$SPID" 2>/dev/null || { tail -n 20 "$ROOT/logs/supervisor.log" "$ROOT/logs/worker.log" 2>/dev/null | redact; die "supervisor failed to start"; }
+    log "DONE: worker running and authenticated under the supervisor (pid $SPID). It restarts on crash."
+    command -v crontab >/dev/null 2>&1 || log "NOTE: no cron here, so a reboot stops the worker until someone starts it again."
+  fi
 }
 
 status_cmd() {
